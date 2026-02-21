@@ -1,0 +1,8 @@
+index.original.html
+*.source.html
+.env
+config.json
+credentials.*
+*.key
+*.pem
+.staticrypt.json
