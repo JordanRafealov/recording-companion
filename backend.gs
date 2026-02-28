@@ -16,16 +16,41 @@
  *   SLACK_WEBHOOK_URL   = for posting session summaries to Slack
  *   CLICKUP_API_TOKEN   = for creating tasks from action items
  *   CLICKUP_LIST_ID     = target list for ClickUp tasks
+ *   MODEL_SMART          = Claude model for complex tasks (default: claude-sonnet-4-6-20250514)
+ *   MODEL_FAST           = Claude model for quick tasks (default: claude-haiku-4-5-20251001)
  */
 
 const FOLDER_NAME = 'Recording Companion Backups';
 
+
+// ==================== CONFIG ====================
+
+function getModel(tier) {
+  var props = PropertiesService.getScriptProperties();
+  if (tier === 'smart') return props.getProperty('MODEL_SMART') || 'claude-sonnet-4-6-20250514';
+  return props.getProperty('MODEL_FAST') || 'claude-haiku-4-5-20251001';
+}
+
+// ==================== RATE LIMITING ====================
+
+function checkRateLimit() {
+  var userProps = PropertiesService.getUserProperties();
+  var lastCall = userProps.getProperty('lastAiCall');
+  var now = Date.now();
+  if (lastCall && (now - parseInt(lastCall)) < 2000) {
+    return { error: 'Please wait 2 seconds between AI requests.' };
+  }
+  userProps.setProperty('lastAiCall', now.toString());
+  return null;
+}
 // ==================== ROUTING ====================
 
 function doPost(e) {
   try {
+    if (!e || !e.postData || !e.postData.contents) return respond({ error: 'Empty request body' });
     const data = JSON.parse(e.postData.contents);
     const action = data.action;
+    if (!action) return respond({ error: 'Missing action field' });
 
     switch (action) {
       case 'backup':       return respond(saveBackup(data.sessionName, data.sessionData));
@@ -154,6 +179,7 @@ function webSearch(query, count) {
 function aiDebrief(sessionData) {
   var apiKey = PropertiesService.getScriptProperties().getProperty('ANTHROPIC_API_KEY');
   if (!apiKey) return { error: 'AI not configured. Add ANTHROPIC_API_KEY in Script Properties.' };
+  var rateError = checkRateLimit(); if (rateError) return rateError;
 
   var recordingType = sessionData.recordingType || 'casestudy';
   var typeLabel = { casestudy: 'Case Study', podcast: 'Podcast', discovery: 'Discovery Call' }[recordingType] || 'Recording';
@@ -184,7 +210,7 @@ function aiDebrief(sessionData) {
     '\nDURATION: ' + (sessionData.recordingLength || '00:00');
 
   if (sessionData.transcript) {
-    ctx += '\n\nTRANSCRIPT:\n' + sessionData.transcript.substring(0, 6000);
+    ctx += '\n\nTRANSCRIPT:\n' + sessionData.transcript.substring(0, 15000);
   }
 
   ctx += '\n\nQUESTIONS AND NOTES:\n';
@@ -199,7 +225,7 @@ function aiDebrief(sessionData) {
     var resp = UrlFetchApp.fetch('https://api.anthropic.com/v1/messages', {
       method: 'post',
       headers: { 'x-api-key': apiKey, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
-      payload: JSON.stringify({ model: 'claude-sonnet-4-6-20250514', max_tokens: 4096, system: systemPrompt, messages: [{ role: 'user', content: ctx }] }),
+      payload: JSON.stringify({ model: getModel('smart'), max_tokens: 4096, system: systemPrompt, messages: [{ role: 'user', content: ctx }] }),
       muteHttpExceptions: true
     });
     var result = JSON.parse(resp.getContentText());
@@ -215,6 +241,7 @@ function aiDebrief(sessionData) {
 function aiFollowUp(questionText, notes, sessionContext) {
   var apiKey = PropertiesService.getScriptProperties().getProperty('ANTHROPIC_API_KEY');
   if (!apiKey) return { error: 'AI not configured.' };
+  var rateError = checkRateLimit(); if (rateError) return rateError;
 
   var systemPrompt = 'You are an interview coach watching a live session. Suggest ONE follow-up question that digs deeper.\n' +
     'Return JSON: {"followUp": "Question under 30 words", "why": "10-word reason"}\nReturn ONLY valid JSON.';
@@ -224,7 +251,7 @@ function aiFollowUp(questionText, notes, sessionContext) {
     var resp = UrlFetchApp.fetch('https://api.anthropic.com/v1/messages', {
       method: 'post',
       headers: { 'x-api-key': apiKey, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
-      payload: JSON.stringify({ model: 'claude-haiku-4-5-20251001', max_tokens: 200, system: systemPrompt, messages: [{ role: 'user', content: userPrompt }] }),
+      payload: JSON.stringify({ model: getModel('fast'), max_tokens: 200, system: systemPrompt, messages: [{ role: 'user', content: userPrompt }] }),
       muteHttpExceptions: true
     });
     var result = JSON.parse(resp.getContentText());
@@ -239,6 +266,12 @@ function aiFollowUp(questionText, notes, sessionContext) {
 function aiGuestPrep(guestName, company, linkedinUrl, recordingType) {
   var apiKey = PropertiesService.getScriptProperties().getProperty('ANTHROPIC_API_KEY');
   if (!apiKey) return { error: 'AI not configured.' };
+
+  // Cache guest prep results for 24h to avoid duplicate research costs
+  var cacheKey = 'prep_' + (guestName + '_' + (company || '')).toLowerCase().replace(/\W/g, '_');
+  var cached = CacheService.getScriptCache().get(cacheKey);
+  if (cached) { try { return JSON.parse(cached); } catch(e) {} }
+  var rateError = checkRateLimit(); if (rateError) return rateError;
   var typeLabel = { casestudy: 'case study', podcast: 'podcast', discovery: 'discovery call' }[recordingType] || 'recording';
 
   var searchResults = webSearch(guestName + ' ' + (company || ''), 6);
@@ -258,13 +291,13 @@ function aiGuestPrep(guestName, company, linkedinUrl, recordingType) {
     var resp = UrlFetchApp.fetch('https://api.anthropic.com/v1/messages', {
       method: 'post',
       headers: { 'x-api-key': apiKey, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
-      payload: JSON.stringify({ model: 'claude-haiku-4-5-20251001', max_tokens: 600, system: systemPrompt, messages: [{ role: 'user', content: 'Guest: ' + guestName + '\nCompany: ' + (company || '') + webContext }] }),
+      payload: JSON.stringify({ model: getModel('fast'), max_tokens: 600, system: systemPrompt, messages: [{ role: 'user', content: 'Guest: ' + guestName + '\nCompany: ' + (company || '') + webContext }] }),
       muteHttpExceptions: true
     });
     var result = JSON.parse(resp.getContentText());
     if (result.error) return { error: result.error.message, sources: sources };
     var text = result.content[0].text.replace(/^```json?\s*\n?/, '').replace(/\n?```\s*$/, '').trim();
-    try { var p = JSON.parse(text); p.sources = sources; p.success = true; return p; }
+    try { var p = JSON.parse(text); p.sources = sources; p.success = true; p.cached = false; try { CacheService.getScriptCache().put(cacheKey, JSON.stringify(p), 86400); } catch(ce) {} return p; }
     catch (e) { return { bio: text, sources: sources, success: true }; }
   } catch (e) { return { error: e.message, sources: sources }; }
 }
@@ -274,6 +307,7 @@ function aiGuestPrep(guestName, company, linkedinUrl, recordingType) {
 function aiCoach(sessionSnapshot) {
   var apiKey = PropertiesService.getScriptProperties().getProperty('ANTHROPIC_API_KEY');
   if (!apiKey) return { tips: [] };
+  var rateError = checkRateLimit(); if (rateError) return rateError;
 
   var systemPrompt = 'You are a real-time interview coach watching a live session. Analyze the current state and return coaching tips.\n\n' +
     'Return JSON: {"tips": [{"type": "warning|suggestion|praise", "icon": "emoji", "text": "Under 25 words"}], "score": 0-100, "momentum": "strong|steady|needs-attention"}\n\n' +
@@ -284,7 +318,7 @@ function aiCoach(sessionSnapshot) {
     var resp = UrlFetchApp.fetch('https://api.anthropic.com/v1/messages', {
       method: 'post',
       headers: { 'x-api-key': apiKey, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
-      payload: JSON.stringify({ model: 'claude-haiku-4-5-20251001', max_tokens: 400, system: systemPrompt, messages: [{ role: 'user', content: JSON.stringify(sessionSnapshot) }] }),
+      payload: JSON.stringify({ model: getModel('fast'), max_tokens: 400, system: systemPrompt, messages: [{ role: 'user', content: JSON.stringify(sessionSnapshot) }] }),
       muteHttpExceptions: true
     });
     var result = JSON.parse(resp.getContentText());
@@ -299,6 +333,7 @@ function aiCoach(sessionSnapshot) {
 function aiChat(question, context, messages) {
   var apiKey = PropertiesService.getScriptProperties().getProperty('ANTHROPIC_API_KEY');
   if (!apiKey) return { response: 'AI not configured.' };
+  var rateError = checkRateLimit(); if (rateError) return rateError;
 
   var systemPrompt = 'You are a senior recording coach. Help interviewers get better answers, handle awkward moments, and extract maximum value.\nKeep answers concise (2-4 sentences). Be actionable.\n\nSession context:\n' + (context || '{}');
   var chatMessages = (messages || []).filter(function(m) { return m.role && m.content; }).map(function(m) { return { role: m.role, content: m.content }; });
@@ -308,7 +343,7 @@ function aiChat(question, context, messages) {
     var resp = UrlFetchApp.fetch('https://api.anthropic.com/v1/messages', {
       method: 'post',
       headers: { 'x-api-key': apiKey, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
-      payload: JSON.stringify({ model: 'claude-haiku-4-5-20251001', max_tokens: 500, system: systemPrompt, messages: chatMessages.length > 0 ? chatMessages : [{ role: 'user', content: question || 'Help me.' }] }),
+      payload: JSON.stringify({ model: getModel('fast'), max_tokens: 500, system: systemPrompt, messages: chatMessages.length > 0 ? chatMessages : [{ role: 'user', content: question || 'Help me.' }] }),
       muteHttpExceptions: true
     });
     var result = JSON.parse(resp.getContentText());
@@ -322,6 +357,7 @@ function aiChat(question, context, messages) {
 function aiLiveCoach(transcriptChunk, prospectContext, conversationSummary, gapProgress) {
   var apiKey = PropertiesService.getScriptProperties().getProperty('ANTHROPIC_API_KEY');
   if (!apiKey) return { error: 'AI not configured.' };
+  var rateError = checkRateLimit(); if (rateError) return rateError;
 
   var systemPrompt = 'You are Keenan, a world-class sales coach who wrote Gap Selling. You are watching a LIVE discovery call in real time via transcript.\n\n' +
     'Your job: analyze the conversation and coach the sales rep with suggested questions based on Gap Selling methodology.\n\n' +
@@ -356,15 +392,15 @@ function aiLiveCoach(transcriptChunk, prospectContext, conversationSummary, gapP
 
   var userPrompt = '';
   if (prospectContext) userPrompt += 'PROSPECT CONTEXT:\n' + prospectContext.substring(0, 1500) + '\n\n';
-  if (conversationSummary) userPrompt += 'CONVERSATION SO FAR:\n' + conversationSummary.substring(0, 2000) + '\n\n';
+  if (conversationSummary) userPrompt += 'CONVERSATION SO FAR:\n' + conversationSummary.substring(0, 4000) + '\n\n';
   if (gapProgress) userPrompt += 'CURRENT GAP PROGRESS:\n' + JSON.stringify(gapProgress) + '\n\n';
-  userPrompt += 'LATEST TRANSCRIPT:\n' + (transcriptChunk || '').substring(0, 2000);
+  userPrompt += 'LATEST TRANSCRIPT:\n' + (transcriptChunk || '').substring(0, 5000);
 
   try {
     var resp = UrlFetchApp.fetch('https://api.anthropic.com/v1/messages', {
       method: 'post',
       headers: { 'x-api-key': apiKey, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
-      payload: JSON.stringify({ model: 'claude-sonnet-4-6-20250514', max_tokens: 1200, system: systemPrompt, messages: [{ role: 'user', content: userPrompt }] }),
+      payload: JSON.stringify({ model: getModel('smart'), max_tokens: 1200, system: systemPrompt, messages: [{ role: 'user', content: userPrompt }] }),
       muteHttpExceptions: true
     });
     var result = JSON.parse(resp.getContentText());
@@ -380,6 +416,7 @@ function aiLiveCoach(transcriptChunk, prospectContext, conversationSummary, gapP
 function aiDeepPrep(guestName, company, linkedinUrl, website, industry) {
   var apiKey = PropertiesService.getScriptProperties().getProperty('ANTHROPIC_API_KEY');
   if (!apiKey) return { error: 'AI not configured.' };
+  var rateError = checkRateLimit(); if (rateError) return rateError;
 
   // Run multiple searches for comprehensive research
   var searches = [];
@@ -436,7 +473,7 @@ function aiDeepPrep(guestName, company, linkedinUrl, website, industry) {
     var resp = UrlFetchApp.fetch('https://api.anthropic.com/v1/messages', {
       method: 'post',
       headers: { 'x-api-key': apiKey, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
-      payload: JSON.stringify({ model: 'claude-sonnet-4-6-20250514', max_tokens: 1500, system: systemPrompt, messages: [{ role: 'user', content: 'Research target: ' + guestName + '\nCompany: ' + (company || 'Unknown') + '\nIndustry: ' + (industry || 'Unknown') + '\n\n' + webContext }] }),
+      payload: JSON.stringify({ model: getModel('smart'), max_tokens: 1500, system: systemPrompt, messages: [{ role: 'user', content: 'Research target: ' + guestName + '\nCompany: ' + (company || 'Unknown') + '\nIndustry: ' + (industry || 'Unknown') + '\n\n' + webContext }] }),
       muteHttpExceptions: true
     });
     var result = JSON.parse(resp.getContentText());
