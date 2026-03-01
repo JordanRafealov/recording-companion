@@ -16,7 +16,7 @@
  *   SLACK_WEBHOOK_URL   = for posting session summaries to Slack
  *   CLICKUP_API_TOKEN   = for creating tasks from action items
  *   CLICKUP_LIST_ID     = target list for ClickUp tasks
- *   MODEL_SMART          = Claude model for complex tasks (default: claude-sonnet-4-6-20250514)
+ *   MODEL_SMART          = Claude model for complex tasks (default: claude-sonnet-4-20250514)
  *   MODEL_FAST           = Claude model for quick tasks (default: claude-haiku-4-5-20251001)
  */
 
@@ -27,7 +27,7 @@ const FOLDER_NAME = 'Recording Companion Backups';
 
 function getModel(tier) {
   var props = PropertiesService.getScriptProperties();
-  if (tier === 'smart') return props.getProperty('MODEL_SMART') || 'claude-sonnet-4-6-20250514';
+  if (tier === 'smart') return props.getProperty('MODEL_SMART') || 'claude-sonnet-4-20250514';
   return props.getProperty('MODEL_FAST') || 'claude-haiku-4-5-20251001';
 }
 
@@ -80,9 +80,72 @@ function doGet(e) {
     if (action === 'restore') return respond(loadBackup(e.parameter.session));
     if (action === 'list')    return respond(listBackups());
     if (action === 'ping')    return respond(getPingStatus());
+    if (action === 'test_ai') return respond(testAi());
+    // Support POST-like actions via GET with JSON payload in 'data' param
+    if (action && e.parameter.data) {
+      try {
+        var data = JSON.parse(decodeURIComponent(e.parameter.data));
+        data.action = action;
+        return doPostFromData(data);
+      } catch(parseErr) {
+        return respond({ error: 'Invalid data param: ' + parseErr.message });
+      }
+    }
     return respond({ error: 'Unknown action' });
   } catch (err) {
     return respond({ error: err.message });
+  }
+}
+
+function doPostFromData(data) {
+  var action = data.action;
+  switch (action) {
+    case 'backup':       return respond(saveBackup(data.sessionName, data.sessionData));
+    case 'restore':      return respond(loadBackup(data.sessionName));
+    case 'list':         return respond(listBackups());
+    case 'ai_debrief':   return respond(aiDebrief(data.sessionData));
+    case 'ai_followup':  return respond(aiFollowUp(data.questionText, data.notes, data.sessionContext));
+    case 'ai_guest_prep': return respond(aiGuestPrep(data.guestName, data.company, data.linkedinUrl, data.recordingType));
+    case 'ai_chat':      return respond(aiChat(data.question, data.context, data.messages));
+    case 'ai_coach':     return respond(aiCoach(data.sessionSnapshot));
+    case 'ai_live_coach': return respond(aiLiveCoach(data.transcriptChunk, data.prospectContext, data.conversationSummary, data.gapProgress));
+    case 'ai_deep_prep': return respond(aiDeepPrep(data.guestName, data.company, data.linkedinUrl, data.website, data.industry));
+    case 'export_doc':   return respond(createGoogleDoc(data.sessionData));
+    case 'slack_notify':  return respond(postToSlack(data.payload));
+    case 'create_tasks': return respond(createClickUpTasks(data.tasks, data.listId));
+    default: return respond({ error: 'Unknown action: ' + action });
+  }
+}
+
+function testAi() {
+  var rateErr = checkRateLimit();
+  if (rateErr) return rateErr;
+  var props = PropertiesService.getScriptProperties();
+  var apiKey = props.getProperty('ANTHROPIC_API_KEY');
+  if (!apiKey) return { error: 'ANTHROPIC_API_KEY not set in Script Properties' };
+  try {
+    var response = UrlFetchApp.fetch('https://api.anthropic.com/v1/messages', {
+      method: 'post',
+      headers: {
+        'x-api-key': apiKey,
+        'anthropic-version': '2023-06-01',
+        'content-type': 'application/json'
+      },
+      payload: JSON.stringify({
+        model: getModel('fast'),
+        max_tokens: 100,
+        messages: [{ role: 'user', content: 'Reply with exactly: Recording Companion AI is working.' }]
+      })
+    });
+    var result = JSON.parse(response.getContentText());
+    return {
+      ok: true,
+      model: getModel('fast'),
+      response: result.content[0].text,
+      usage: result.usage
+    };
+  } catch (err) {
+    return { error: 'AI test failed: ' + err.message };
   }
 }
 

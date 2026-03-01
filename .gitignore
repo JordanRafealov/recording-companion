@@ -1,9 +1,11 @@
-index.original.html
-recording-companion.html
-*.source.html
+.clasp.json
 .env
-config.json
-credentials.*
+.staticrypt.json
 *.key
 *.pem
-.staticrypt.json
+*.source.html
+config.json
+credentials.*
+index.original.html
+recording-companion.html
+backend.gs.bak
